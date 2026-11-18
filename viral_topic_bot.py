@@ -1,13 +1,18 @@
 import os
 import sys
 import json
+import time
 import random
 import requests
 from datetime import datetime, timezone, timedelta
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = str(os.environ.get("CHAT_ID"))
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+CHAT_ID = str(os.environ.get("CHAT_ID", "")).strip()
 STATE_FILE = "bot_state.json"
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+}
 
 SEED_QUERIES = [
     ("JEE Mains 2027", "JEE Mains"),
@@ -34,33 +39,46 @@ def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
+def safe_request(method, url, **kwargs):
+    kwargs.setdefault("headers", HEADERS)
+    kwargs.setdefault("timeout", 15)
+    for attempt in range(3):
+        try:
+            if method == "GET":
+                return requests.get(url, **kwargs)
+            return requests.post(url, **kwargs)
+        except Exception as e:
+            print(f"Retry {attempt + 1} due to: {e}")
+            time.sleep(2)
+    return None
+
 def check_for_send_command(state):
-    """Telegram par tumhara 'send' message check karta hai"""
     offset = state.get("last_update_id", 0) + 1
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={offset}&timeout=5"
     triggered = False
-    try:
-        resp = requests.get(url, timeout=10).json()
-        if resp.get("ok"):
-            for update in resp.get("result", []):
+    resp = safe_request("GET", url)
+    if resp and resp.status_code == 200:
+        data = resp.json()
+        if data.get("ok"):
+            for update in data.get("result", []):
                 state["last_update_id"] = update["update_id"]
                 msg = update.get("message", {})
                 sender_id = str(msg.get("chat", {}).get("id", ""))
                 text = msg.get("text", "").strip().lower()
                 if sender_id == CHAT_ID and text in ["send", "/send", "topics", "topic"]:
                     triggered = True
-    except Exception as e:
-        print(f"Update check error: {e}")
     return triggered
 
 def get_live_student_searches(seed):
-    url = f"http://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q={requests.utils.quote(seed)}"
-    try:
-        resp = requests.get(url, timeout=8)
-        data = resp.json()
-        return [s for s in data[1] if s.lower() != seed.lower()][:4]
-    except Exception:
-        return []
+    url = f"https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q={requests.utils.quote(seed)}"
+    resp = safe_request("GET", url)
+    if resp and resp.status_code == 200:
+        try:
+            data = resp.json()
+            return [s for s in data[1] if s.lower() != seed.lower()][:4]
+        except Exception:
+            return []
+    return []
 
 def format_as_viral_title(raw_query, category, month):
     q = raw_query.title()
@@ -74,7 +92,9 @@ def format_as_viral_title(raw_query, category, month):
 
 def send_telegram_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"})
+    resp = safe_request("POST", url, data={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"})
+    if resp:
+        print("Telegram response:", resp.status_code, resp.text)
 
 def generate_and_send_topics(state):
     ist_str, current_month = get_ist_time()
