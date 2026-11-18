@@ -40,5 +40,8 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add bot_state.json
-          git commit -m "Update bot state" || exit 0
-          git push
+          if ! git diff --staged --quiet; then
+            git commit -m "Update bot state"
+            git pull --rebase origin main
+            git push
+          fi
