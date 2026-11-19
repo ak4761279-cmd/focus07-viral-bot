@@ -47,11 +47,17 @@ def get_channel_data():
 def get_video_transcript(video_id):
     """Fetch spoken Hindi/English transcript of the latest video."""
     try:
-        transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['hi', 'en', 'en-IN'])
-        full_text = " ".join([t['text'] for t in transcript_list])
+        ytt_api = YouTubeTranscriptApi()
+        transcript_list = ytt_api.fetch(video_id, languages=['hi', 'en', 'en-IN'])
+        full_text = " ".join([t.text for t in transcript_list])
         return full_text[:3000]
     except Exception:
-        return "Transcript/Captions available nahi hain (Auto-captions off ya audio unclear ho sakta hai)."
+        try:
+            transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['hi', 'en', 'en-IN'])
+            full_text = " ".join([t['text'] for t in transcript_list])
+            return full_text[:3000]
+        except Exception:
+            return "Transcript/Captions available nahi hain (Auto-captions off ya audio unclear ho sakta hai)."
 
 def get_realtime_trends():
     """Fetch real-time rising searches in India for Focus 07 niche."""
@@ -133,11 +139,18 @@ Include these 4 sections strictly:
 4. 🔥 <b>AAJ KE 5 VIRAL VIDEO TOPICS ({TODAY_STR})</b>: Bihar Engineering, Polytechnic, Paramedical/Nursing aur JEE students ke liye 5 exact clickable titles + unka 1-line thumbnail text idea.
 """
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[thumb_image, prompt]
-    )
-    return response.text
+    for model_name in ["gemini-3.8-flash", "gemini-flash-latest"]:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[thumb_image, prompt]
+            )
+            return response.text
+        except Exception as e:
+            last_err = str(e)
+            continue
+            
+    raise RuntimeError(f"Gemini model error: {last_err}")
 
 def send_telegram_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
