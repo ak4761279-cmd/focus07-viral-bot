@@ -139,7 +139,7 @@ Include these 4 sections strictly:
 4. 🔥 <b>AAJ KE 5 VIRAL VIDEO TOPICS ({TODAY_STR})</b>: Bihar Engineering, Polytechnic, Paramedical/Nursing aur JEE students ke liye 5 exact clickable titles + unka 1-line thumbnail text idea.
 """
 
-    for model_name in ["gemini-3.8-flash", "gemini-flash-latest"]:
+    for model_name in ["gemini-2.5-flash"]:
         try:
             response = client.models.generate_content(
                 model=model_name,
