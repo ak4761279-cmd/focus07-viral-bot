@@ -17,32 +17,33 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 IST = timezone(timedelta(hours=5, minutes=30))
 TODAY_STR = datetime.now(IST).strftime("%d %b %Y (%A)")
 
+
 def get_channel_data():
-    """Fetch channel stats and latest 5 videos using either @Handle or UC... Channel ID."""
+    """Fetch channel stats and latest 5 videos using either @handle or UC... Channel ID."""
     if YT_CHANNEL_ID.startswith("@"):
         ch_url = f"https://www.googleapis.com/youtube/v3/channels?part=snippet,statistics,contentDetails&forHandle={YT_CHANNEL_ID}&key={YT_API_KEY}"
     else:
         ch_url = f"https://www.googleapis.com/youtube/v3/channels?part=snippet,statistics,contentDetails&id={YT_CHANNEL_ID}&key={YT_API_KEY}"
-        
+
     ch_res = requests.get(ch_url, timeout=15).json()
-    
     if not ch_res.get("items"):
         return None, []
-        
+
     channel_info = ch_res["items"][0]
     uploads_playlist = channel_info["contentDetails"]["relatedPlaylists"]["uploads"]
-    
+
     pl_url = f"https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&playlistId={uploads_playlist}&maxResults=5&key={YT_API_KEY}"
     pl_res = requests.get(pl_url, timeout=15).json()
-    
+
     video_ids = [item["snippet"]["resourceId"]["videoId"] for item in pl_res.get("items", [])]
     if not video_ids:
         return channel_info, []
-        
+
     vid_url = f"https://www.googleapis.com/youtube/v3/videos?part=snippet,statistics&id={','.join(video_ids)}&key={YT_API_KEY}"
     vid_res = requests.get(vid_url, timeout=15).json()
-    
+
     return channel_info, vid_res.get("items", [])
+
 
 def get_video_transcript(video_id):
     """Fetch spoken Hindi/English transcript of the latest video."""
@@ -58,6 +59,7 @@ def get_video_transcript(video_id):
             return full_text[:3000]
         except Exception:
             return "Transcript/Captions available nahi hain (Auto-captions off ya audio unclear ho sakta hai)."
+
 
 def get_realtime_trends():
     """Fetch real-time rising searches in India for Focus 07 niche."""
@@ -79,67 +81,80 @@ def get_realtime_trends():
                 trends_summary.append(f"{kw}: {', '.join(top_rising)}")
     except Exception as e:
         trends_summary.append(f"Trends fallback active ({str(e)[:40]})")
-        
-    return "\n".join(trends_summary) if trends_summary else "No sudden spike data; focus on ongoing admission, counselling, and semester exam updates."
 
-def generate_coach_report(channel_info, videos):
-    """Use Gemini Vision + Text to audit latest thumbnail, spoken script, channel SEO, and generate 5 viral topics."""
+    return "\n".join(trends_summary) if trends_summary else "No sudden spike; focus on ongoing BEU/BCECE/DCECE exam & counselling cycle."
+
+
+def get_working_models(client):
+    """Auto-discover available Gemini Flash models from API so 404 never happens."""
+    candidates = [
+        "gemini-3.8-flash",
+        "gemini-3.5-flash",
+        "gemini-3.0-flash",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash"
+    ]
+    try:
+        for m in client.models.list():
+            name = getattr(m, "name", "")
+            if "flash" in name and "lite" not in name and "8b" not in name:
+                clean_name = name.replace("models/", "")
+                if clean_name not in candidates:
+                    candidates.insert(0, clean_name)
+    except Exception:
+        pass
+    return candidates
+
+
+def generate_coach_report(channel_info, videos, transcript, trends_text):
+    """Send channel stats, thumbnail image, transcript, and trends to Gemini."""
     client = genai.Client(api_key=GEMINI_API_KEY)
-    
-    stats = channel_info.get("statistics", {})
-    snippet = channel_info.get("snippet", {})
-    
-    latest_video = videos[0]
-    latest_id = latest_video["id"]
-    latest_title = latest_video["snippet"]["title"]
-    latest_tags = latest_video["snippet"].get("tags", [])
-    latest_views = latest_video["statistics"].get("viewCount", "0")
-    
-    thumbs = latest_video["snippet"]["thumbnails"]
+
+    subs = channel_info["statistics"].get("subscriberCount", "Hidden")
+    total_views = channel_info["statistics"].get("viewCount", "0")
+
+    video_lines = []
+    for i, v in enumerate(videos, 1):
+        title = v["snippet"]["title"]
+        views = v["statistics"].get("viewCount", "0")
+        likes = v["statistics"].get("likeCount", "0")
+        comments = v["statistics"].get("commentCount", "0")
+        pub = v["snippet"]["publishedAt"][:10]
+        video_lines.append(f"{i}. [{pub}] '{title}' -> {views} views, {likes} likes, {comments} comments")
+
+    latest_vid = videos[0]
+    thumbs = latest_vid["snippet"]["thumbnails"]
     thumb_url = thumbs.get("maxres", thumbs.get("high", thumbs.get("default")))["url"]
     img_bytes = requests.get(thumb_url, timeout=15).content
     thumb_image = Image.open(io.BytesIO(img_bytes))
-    
-    transcript_text = get_video_transcript(latest_id)
-    trends_data = get_realtime_trends()
-    
-    recent_list = "\n".join([
-        f"- {v['snippet']['title']} (Views: {v['statistics'].get('viewCount', 0)})"
-        for v in videos
-    ])
 
     prompt = f"""
-You are the personal YouTube Growth Coach for 'FOCUS-07' (Bihar Engineering, Polytechnic, Paramedical/Nursing & JEE educational channel run by Shivam).
-Today's Date: {TODAY_STR}
+Tum YouTube Growth Coach ho Shivam ke channel 'Focus 07' (Bihar Engineering University BEU, BCECE, DCECE, Polytechnic, Paramedical updates) ke liye.
+Aaj ki date hai: {TODAY_STR}.
 
-CHANNEL STATS:
-- Subscribers: {stats.get('subscriberCount')}
-- Total Views: {stats.get('viewCount')}
-- Channel Description: {snippet.get('description', '')[:300]}
+CHANNEL DATA:
+- Subscribers: {subs} | Total Views: {total_views}
+- Recent 5 Videos:
+{chr(10).join(video_lines)}
 
-RECENT 5 VIDEOS:
-{recent_list}
+LATEST VIDEO TRANSCRIPT (Spoken Content):
+{transcript}
 
-LATEST VIDEO DETAILS:
-- Title: {latest_title}
-- Views: {latest_views}
-- Tags Count: {len(latest_tags)} ({', '.join(latest_tags[:8])})
-- Spoken Transcript Snippet: {transcript_text}
+GOOGLE REAL-TIME RISING TRENDS (India):
+{trends_text}
 
-REAL-TIME GOOGLE TRENDS (INDIA - LAST 7 DAYS):
-{trends_data}
-
-TASK:
-Analyze the attached thumbnail image of the latest video along with its spoken transcript, title, tags, and channel stats. Write a crisp, practical, high-impact Telegram report in Hinglish (Hindi + English mix) under 3500 characters using clean HTML bold/italic tags (<b>, <i>) ONLY (no markdown asterisks ** or ##).
-
-Include these 4 sections strictly:
-1. 🖼️ <b>LATEST THUMBNAIL AUDIT (10 me se Score)</b>: Text readability on mobile, color contrast, face/emotion/curiosity, aur 2 exact fixes.
-2. 🎙️ <b>VIDEO SPEAKING & HOOK AUDIT</b>: Transcript ke base par batao ki shuru ke 30 second ka hook kaisa tha, bolne ki clarity/energy kaisi thi, aur CTA (Subscribe/WhatsApp group) sahi jagah tha ya nahi.
-3. ⚠️ <b>CHANNEL & SEO KAMIYA (ACTIONABLE FIXES)</b>: Recent 5 videos aur tags/description dekh kar 3 badi kamiya jo views rok rahi hain.
-4. 🔥 <b>AAJ KE 5 VIRAL VIDEO TOPICS ({TODAY_STR})</b>: Bihar Engineering, Polytechnic, Paramedical/Nursing aur JEE students ke liye 5 exact clickable titles + unka 1-line thumbnail text idea.
+TUMHARA KAAM (Hinglish mein, seedha aur actionable, Telegram HTML format mein sirf <b> aur <i> tags use karke, koi markdown ** ya # nahi):
+1. <b>📊 CHANNEL SNAPSHOT</b>: Subscribers, total views aur recent 5 videos ka short performance review.
+2. <b>🖼️ THUMBNAIL & HOOK AUDIT</b>: Attached latest thumbnail image aur spoken transcript ke base par batao kya visual ya opening hook weak hai aur exact kya sudhaar karein.
+3. <b>⚠️ KAMIYA (ACTIONABLE FIXES)</b>: Recent 5 videos mein CTR, title, ya topic selection ki 3 concrete kamiya aur unka fix.
+4. <b>🔥 AAJ KE 5 VIRAL VIDEO TOPICS ({TODAY_STR})</b>: Bihar Engineering, Polytechnic, BCECE/DCECE students ke liye 5 high-demand video ideas, har ek ke liye:
+   - Clickable Hinglish Title
+   - Thumbnail Text (3-4 words)
+   - Kyun chalega (1 line)
 """
 
-    for model_name in ["gemini-2.5-flash"]:
+    last_err = ""
+    for model_name in get_working_models(client):
         try:
             response = client.models.generate_content(
                 model=model_name,
@@ -149,8 +164,9 @@ Include these 4 sections strictly:
         except Exception as e:
             last_err = str(e)
             continue
-            
+
     raise RuntimeError(f"Gemini model error: {last_err}")
+
 
 def send_telegram_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -163,14 +179,19 @@ def send_telegram_message(text):
             "disable_web_page_preview": True
         }
         res = requests.post(url, json=payload, timeout=15)
-        if res.status_code != 200:
+        if not res.ok:
+            # Fallback without HTML parsing if special characters break tags
             payload.pop("parse_mode", None)
             requests.post(url, json=payload, timeout=15)
 
+
 if __name__ == "__main__":
-    ch_info, vids = get_channel_data()
-    if not ch_info or not vids:
-        send_telegram_message("⚠️ Focus 07 Bot Alert: YT_CHANNEL_ID ya YT_API_KEY check karein, channel data fetch nahi ho paya.")
+    channel_info, videos = get_channel_data()
+    if not channel_info or not videos:
+        send_telegram_message("⚠️ Focus 07 Bot Alert: YouTube channel data fetch nahi ho paya. YT_CHANNEL_ID ya YT_API_KEY check karein.")
     else:
-        report = generate_coach_report(ch_info, vids)
+        transcript = get_video_transcript(videos[0]["id"])
+        trends_text = get_realtime_trends()
+        report = generate_coach_report(channel_info, videos, transcript, trends_text)
         send_telegram_message(report)
+
