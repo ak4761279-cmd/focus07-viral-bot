@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import time
 import textwrap
 import requests
 from bs4 import BeautifulSoup
@@ -116,8 +117,8 @@ def get_realtime_trends():
 
 
 def get_working_models(client):
-    """Discover active Gemini models supporting generateContent without deprecated 2.0/2.5 models."""
-    candidates = ["gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-3.8-pro"]
+    """Discover active Gemini models including lite/pro fallbacks to beat 503 high-demand spikes."""
+    candidates = ["gemini-3.8-flash-lite", "gemini-3.8-flash", "gemini-3.8-pro"]
     try:
         for m in client.models.list():
             name = getattr(m, "name", "").replace("models/", "")
@@ -128,7 +129,7 @@ def get_working_models(client):
                         candidates.append(name)
     except Exception:
         pass
-    return candidates[:5]
+    return candidates[:6]
 
 
 def generate_coach_report(client, channel_info, videos, transcript, trends_text, notices_text):
@@ -196,31 +197,64 @@ Kyun chalega: [1 line reason]
 - Topic 2 Description, Viral Tags & Pinned Comment
 """
 
-    errors = []
-    for model_name in get_working_models(client):
-        try:
-            contents_payload = [thumb_image, prompt] if thumb_image is not None else [prompt]
-            response = client.models.generate_content(
-                model=model_name,
-                contents=contents_payload
-            )
-            return response.text
-        except Exception as e:
-            err_msg = str(e)
-            errors.append(f"[{model_name}]: {err_msg[:180]}")
-            # Retry text-only if image payload caused an error on the primary model
-            if thumb_image is not None:
-                try:
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=prompt
-                    )
+    models_to_try = get_working_models(client)
+    # Try up to 2 rounds with a 15-second pause if Google servers return 503 high demand
+    for attempt in range(2):
+        for model_name in models_to_try:
+            try:
+                contents_payload = [thumb_image, prompt] if thumb_image is not None else [prompt]
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=contents_payload
+                )
+                if response and response.text:
                     return response.text
-                except Exception as e2:
-                    errors.append(f"[{model_name}-text]: {str(e2)[:180]}")
-            continue
+            except Exception as e:
+                err_str = str(e)
+                if "503" in err_str or "UNAVAILABLE" in err_str:
+                    time.sleep(8)
+                    continue
+                if thumb_image is not None:
+                    try:
+                        response = client.models.generate_content(
+                            model=model_name,
+                            contents=prompt
+                        )
+                        if response and response.text:
+                            return response.text
+                    except Exception:
+                        pass
+                continue
+        if attempt == 0:
+            time.sleep(15)
 
-    raise RuntimeError("Gemini failed on all models:\n" + "\n".join(errors))
+    # Smart Fallback Report so bot NEVER crashes even during Google 503 server spikes
+    return f"""⚠️ Note: Gemini AI servers abhi heavy traffic (503) par hain, isliye live scraped data & ready thumbnails bheje ja rahe hain:
+
+1. 🏛️ LIVE OFFICIAL NOTICE RADAR ({TODAY_STR}):
+{notices_text}
+
+2. 📊 CHANNEL SNAPSHOT:
+- Subscribers: {subs} | Total Views: {total_views}
+- Recent Videos:
+{chr(10).join(video_lines[:3])}
+
+3. 🔥 AAJ KE TOP 3 EVERGREEN VIRAL TOPICS ({TODAY_STR}):
+Topic 1: BEU Semester Exam & Result Big Update 2026
+Clickable Title: BEU Patna Big Update 2026 🚨 Semester Exam & Result Notice जारी!
+Thumbnail Text: BEU BIG NOTICE 2026!
+Kyun chalega: Bihar Engineering students roz latest exam aur result status search karte hain.
+
+Topic 2: Bihar Polytechnic SBTE Odd/Even Sem Strategy
+Clickable Title: SBTE Bihar Polytechnic Exam 2026 🔥 Pass Hone Ka Master Plan!
+Thumbnail Text: SBTE EXAM ALERT!
+Kyun chalega: Polytechnic students ke beech exam tips aur important questions ki high demand rehti hai.
+
+Topic 3: BCECE & DCECE Spot Counselling / Admission Guide
+Clickable Title: BCECE & DCECE 2026 🚨 Bachi Hui Seats Par Admission Kaise Lein?
+Thumbnail Text: SPOT ROUND UPDATE!
+Kyun chalega: Counselling aur vacant seats par high CTR milta hai.
+"""
 
 
 def create_thumbnails_batch(client, report_text):
@@ -229,7 +263,7 @@ def create_thumbnails_batch(client, report_text):
     title_matches = re.findall(r"Clickable Title:\s*(.+)", report_text, re.IGNORECASE)
 
     if not thumb_matches:
-        thumb_matches = ["BEU BIG UPDATE 2026!"]
+        thumb_matches = ["BEU BIG UPDATE 2026!", "SBTE EXAM ALERT!", "BCECE SPOT ROUND!"]
     if not title_matches:
         title_matches = ["Bihar Engineering University Latest Update"]
 
