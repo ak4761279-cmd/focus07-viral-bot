@@ -2,12 +2,13 @@ name: Focus 07 AI Coach & Viral Bot V6
 
 on:
   schedule:
-    - cron: '30 1 * * *' # Roz subah 7:00 AM IST
+    - cron: '30 2 * * *' # Runs daily at 8:00 AM IST
   workflow_dispatch:
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -19,7 +20,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests pytrends google-genai pillow youtube-transcript-api
+          python -m pip install --upgrade pip
+          pip install requests pillow pytrends youtube-transcript-api google-genai beautifulsoup4
 
       - name: Run Focus 07 V6 Bot
         env:
@@ -29,3 +31,4 @@ jobs:
           YT_CHANNEL_ID: ${{ secrets.YT_CHANNEL_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python viral_topic_bot.py
+
