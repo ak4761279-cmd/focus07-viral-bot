@@ -75,7 +75,7 @@ def get_official_notices():
 
     for name, url in portals:
         try:
-            res = requests.get(url, headers=headers, timeout=12, verify=False)
+            res = requests.get(url, headers=headers, timeout=10, verify=False)
             soup = BeautifulSoup(res.text, "html.parser")
             links = []
             for a in soup.find_all("a"):
@@ -102,7 +102,7 @@ def get_realtime_trends():
     keywords = ["Bihar Engineering", "Bihar Polytechnic", "Bihar Paramedical", "BCECE", "JEE Mains"]
     trends_summary = []
     try:
-        pytrends = TrendReq(hl='en-IN', tz=330, timeout=(10, 25))
+        pytrends = TrendReq(hl='en-IN', tz=330, timeout=(8, 15))
         pytrends.build_payload(keywords, cat=0, timeframe='now 7-d', geo='IN')
         related = pytrends.related_queries()
         for kw in keywords:
@@ -116,17 +116,19 @@ def get_realtime_trends():
 
 
 def get_working_models(client):
-    candidates = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.0-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
+    """Discover active Gemini models supporting generateContent without deprecated 2.0/2.5 models."""
+    candidates = ["gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-3.8-pro"]
     try:
         for m in client.models.list():
-            name = getattr(m, "name", "")
-            if "flash" in name and "lite" not in name and "8b" not in name and "image" not in name:
-                clean_name = name.replace("models/", "")
-                if clean_name not in candidates:
-                    candidates.insert(0, clean_name)
+            name = getattr(m, "name", "").replace("models/", "")
+            methods = getattr(m, "supported_generation_methods", []) or []
+            if name and ("flash" in name or "pro" in name) and not any(old in name for old in ["1.0", "1.5", "2.0", "2.5", "image", "tts", "embedding"]):
+                if not methods or "generateContent" in methods:
+                    if name not in candidates:
+                        candidates.append(name)
     except Exception:
         pass
-    return candidates
+    return candidates[:5]
 
 
 def generate_coach_report(client, channel_info, videos, transcript, trends_text, notices_text):
@@ -142,11 +144,15 @@ def generate_coach_report(client, channel_info, videos, transcript, trends_text,
         pub = v["snippet"]["publishedAt"][:10]
         video_lines.append(f"{i}. [{pub}] '{title}' -> {views} views, {likes} likes, {comments} comments")
 
-    latest_vid = videos[0]
-    thumbs = latest_vid["snippet"]["thumbnails"]
-    thumb_url = thumbs.get("maxres", thumbs.get("high", thumbs.get("default")))["url"]
-    img_bytes = requests.get(thumb_url, timeout=15).content
-    thumb_image = Image.open(io.BytesIO(img_bytes))
+    thumb_image = None
+    try:
+        latest_vid = videos[0]
+        thumbs = latest_vid["snippet"]["thumbnails"]
+        thumb_url = thumbs.get("maxres", thumbs.get("high", thumbs.get("default")))["url"]
+        img_bytes = requests.get(thumb_url, timeout=15).content
+        thumb_image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    except Exception:
+        thumb_image = None
 
     prompt = f"""
 Tum YouTube Growth Coach ho Shivam ke channel 'Focus 07' (Bihar Engineering University BEU, BCECE, DCECE, Polytechnic, Paramedical updates) ke liye.
@@ -169,7 +175,7 @@ GOOGLE REAL-TIME RISING TRENDS (India):
 TUMHARA KAAM (Hinglish mein, clean plain text with emojis aur bullet points — bilkul bhi HTML tags ya markdown ** # use mat karna):
 
 1. 🏛️ LIVE OFFICIAL NOTICE RADAR ({TODAY_STR}):
-BEU, BCECEB aur SBTE websites ke taज़ा notices ka short update aur kis par turant video banana chahiye.
+BEU, BCECEB aur SBTE websites ke taaza notices ka short update aur kis par turant video banana chahiye.
 
 2. 📊 CHANNEL SNAPSHOT & THUMBNAIL AUDIT:
 Subscribers, views aur attached thumbnail/transcript mein kya sudhaar karein (2-3 crisp points).
@@ -190,23 +196,35 @@ Kyun chalega: [1 line reason]
 - Topic 2 Description, Viral Tags & Pinned Comment
 """
 
-    last_err = ""
+    errors = []
     for model_name in get_working_models(client):
         try:
+            contents_payload = [thumb_image, prompt] if thumb_image is not None else [prompt]
             response = client.models.generate_content(
                 model=model_name,
-                contents=[thumb_image, prompt]
+                contents=contents_payload
             )
             return response.text
         except Exception as e:
-            last_err = str(e)
+            err_msg = str(e)
+            errors.append(f"[{model_name}]: {err_msg[:180]}")
+            # Retry text-only if image payload caused an error on the primary model
+            if thumb_image is not None:
+                try:
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=prompt
+                    )
+                    return response.text
+                except Exception as e2:
+                    errors.append(f"[{model_name}-text]: {str(e2)[:180]}")
             continue
 
-    raise RuntimeError(f"Gemini model error: {last_err}")
+    raise RuntimeError("Gemini failed on all models:\n" + "\n".join(errors))
 
 
 def create_thumbnails_batch(client, report_text):
-    """Generate up to 3 1280x720 YouTube thumbnails with optional shivam.png cutout on the right."""
+    """Generate up to 3 1280x720 YouTube thumbnails with shivam.png cutout on the right."""
     thumb_matches = re.findall(r"Thumbnail Text:\s*(.+)", report_text, re.IGNORECASE)
     title_matches = re.findall(r"Clickable Title:\s*(.+)", report_text, re.IGNORECASE)
 
@@ -215,7 +233,6 @@ def create_thumbnails_batch(client, report_text):
     if not title_matches:
         title_matches = ["Bihar Engineering University Latest Update"]
 
-    # Check if user uploaded transparent cutout 'shivam.png' in repo root
     cutout_img = None
     if os.path.exists("shivam.png"):
         try:
@@ -237,9 +254,9 @@ def create_thumbnails_batch(client, report_text):
     sub_font = ImageFont.truetype(font_path, 34) if font_path else ImageFont.load_default()
 
     themes = [
-        ((14, 22, 48), (225, 25, 25), (255, 220, 0)),   # Navy + Red + Yellow
-        ((32, 12, 42), (255, 95, 0), (0, 245, 212)),    # Dark Purple + Orange + Cyan
-        ((15, 34, 26), (220, 38, 38), (255, 230, 50))   # Deep Emerald + Red + Gold
+        ((14, 22, 48), (225, 25, 25), (255, 220, 0)),
+        ((32, 12, 42), (255, 95, 0), (0, 245, 212)),
+        ((15, 34, 26), (220, 38, 38), (255, 230, 50))
     ]
 
     generated_thumbs = []
@@ -250,7 +267,6 @@ def create_thumbnails_batch(client, report_text):
 
         bg_img = None
         if idx == 0:
-            # Generate AI studio background for #1 top topic
             try:
                 img_prompt = (
                     f"Dramatic YouTube thumbnail background for Indian engineering college news: {topic_context}. "
@@ -283,7 +299,6 @@ def create_thumbnails_batch(client, report_text):
         overlay = Image.new("RGBA", (1280, 720), (0, 0, 0, 105))
         canvas = Image.alpha_composite(bg_img, overlay)
 
-        # Paste Shivam's cutout on the right side if available
         if cutout_img is not None:
             x_pos = 1280 - cutout_img.width - 20
             y_pos = 720 - cutout_img.height
@@ -291,11 +306,9 @@ def create_thumbnails_batch(client, report_text):
 
         draw = ImageDraw.Draw(canvas)
 
-        # Top Breaking Badge
         draw.rounded_rectangle([55, 50, 510, 118], radius=12, fill=(*badge_rgb, 255))
         draw.text((78, 65), f"FOCUS 07 • TOPIC #{idx + 1}", font=badge_font, fill=(255, 255, 255, 255))
 
-        # Wrap headline narrower if cutout is on right
         wrap_width = 14 if cutout_img else 19
         lines = textwrap.wrap(banner_text, width=wrap_width)[:3]
         y_cursor = 175
@@ -305,7 +318,6 @@ def create_thumbnails_batch(client, report_text):
             draw.text((55, y_cursor), line, font=main_font, fill=t_color)
             y_cursor += 105
 
-        # Bottom Strip
         strip_right = 740 if cutout_img else 1220
         draw.rounded_rectangle([55, 585, strip_right, 655], radius=12, fill=(*highlight_rgb, 255))
         strip_label = "BEU • BCECE • SBTE UPDATE" if cutout_img else "BEU • BCECE • POLYTECHNIC OFFICIAL UPDATE"
