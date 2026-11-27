@@ -1,34 +1,33 @@
-name: Focus 07 AI Coach & Viral Bot V6
-
+name: Focus 07 Deep Competitor & Thumbnail Bot
 on:
-  schedule:
-    - cron: '30 2 * * *' # Runs daily at 8:00 AM IST
   workflow_dispatch:
-
+  schedule:
+    - cron: "0 4,9,14 * * *"   # ~9:30 AM, 2:30 PM, 7:30 PM IST
+permissions:
+  contents: write
+concurrency:
+  group: focus07-competitor-bot
+  cancel-in-progress: false
 jobs:
-  run-bot:
+  run-competitor-intel:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 15
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests pillow pytrends youtube-transcript-api google-genai beautifulsoup4
-
-      - name: Run Focus 07 V6 Bot
+          python-version: "3.11"
+      - run: pip install requests pillow
+      - run: python competitor_radar.py
         env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
-          YT_API_KEY: ${{ secrets.YT_API_KEY }}
-          YT_CHANNEL_ID: ${{ secrets.YT_CHANNEL_ID }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: python viral_topic_bot.py
-
+          TG_TOKEN: ${{ secrets.TG_TOKEN || secrets.BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID || secrets.CHAT_ID }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN || secrets.TG_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID || secrets.TG_CHAT_ID }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      - name: Save memory & thumbnails
+        run: |
+          git config user.name "focus07-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add competitor_memory.json generated_thumbnails || git add competitor_memory.json
+          git diff --cached --quiet || (git commit -m "focus07 competitor intel update" && git push)
