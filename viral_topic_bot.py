@@ -1,407 +1,360 @@
 import os
-import io
 import re
+import io
+import json
 import time
-import textwrap
+import base64
 import requests
-from bs4 import BeautifulSoup
-from datetime import datetime, timezone, timedelta
 from PIL import Image, ImageDraw, ImageFont
-from pytrends.request import TrendReq
-from youtube_transcript_api import YouTubeTranscriptApi
-from google import genai
-from google.genai import types
+from datetime import datetime, timezone, timedelta
 
-# Environment Secrets
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
-YT_API_KEY = os.environ.get("YT_API_KEY")
-YT_CHANNEL_ID = os.environ.get("YT_CHANNEL_ID", "").strip()
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+TG_TOKEN = (os.getenv("TG_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
+TG_CHAT = (os.getenv("TG_CHAT_ID") or os.getenv("CHAT_ID") or "").strip()
+OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
+FORCE = os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch" or os.getenv("FORCE") == "1"
 
 IST = timezone(timedelta(hours=5, minutes=30))
-TODAY_STR = datetime.now(IST).strftime("%d %b %Y (%A)")
+NOW_IST = datetime.now(IST)
+MEM_FILE = "competitor_memory.json"
+OUT_DIR = "generated_thumbnails"
+
+CHANNELS = [
+    {"name": "EASYPREP SEMESTER", "url": "https://www.youtube.com/@easyprepsemester"},
+    {"name": "EzyKnot Careers", "url": "https://www.youtube.com/@ezyknotcareers"},
+]
+
+SEED_VIDEOS = [
+    {
+        "channel": "EASYPREP SEMESTER",
+        "video_id": "HQ_6SMrE13I",
+        "url": "https://www.youtube.com/watch?v=HQ_6SMrE13I",
+        "title": "B.Tech 5th Semester | कैसे होगा इतने कम समय में Syllabus | Academic Schedule | BEU Patna #beu",
+        "published_at": "2026-11-26",
+        "flaws": [
+            "Official schedule aaye bina sirf tentative ~80-day estimate aur aakhir me paid batch pitch.",
+            "Likes-to-views engagement kam; subject priority aur PYQ breakdown missing."
+        ],
+        "predicted_next": ["5th sem subject priority", "PYQ / VVI revision", "paid batch push"],
+        "beat_topic": "BEU 5th Sem Late Start (~80 Days): Kaunse Subjects Pehle Karein & Fast PYQ Plan | Focus 07",
+        "thumb_text": "80 DAYS 5TH SEM PLAN",
+        "beat_angle": "Unke tentative calendar aur course pitch se aage badhkar exact subject priority, PYQ weightage, aur CGPA plan do."
+    },
+    {
+        "channel": "EzyKnot Careers",
+        "video_id": "eTAH0OyJSMI",
+        "url": "https://www.youtube.com/watch?v=eTAH0OyJSMI",
+        "title": "BEU B.Tech 1st Semester End Semester Exam Kab Hoga? | BEU Latest Update | Exam Date, Mid Sem, Form",
+        "published_at": "2026-11-26",
+        "flaws": [
+            "12m 39s me naya exam-date update kam aur purani baaton / app & channel promotion ka repetition zyada.",
+            "PYQs/solutions abhi pending hain; students ko turant ready sample questions nahi diye."
+        ],
+        "predicted_next": ["credit counting & subject priority", "1st sem VVI/PYQ videos", "answer writing"],
+        "beat_topic": "BEU 1st Sem Exam Pattern & Credit Priority | 24 Pass Rule + 10 MCQ Trick in 8 Mins | Focus 07",
+        "thumb_text": "24 PASS + 10 MCQ TRICK",
+        "beat_angle": "12+ min ki repetition ke bajay 8-min crisp breakdown + credit/subject priority + instant PYQ/notes funnel do."
+    },
+    {
+        "channel": "EzyKnot Careers",
+        "video_id": "M0Wcz1fz9Pw",
+        "url": "https://www.youtube.com/watch?v=M0Wcz1fz9Pw",
+        "title": "EGD 1st Semester Exam Preparation| Engineering Graphics and Design Important Question BEU #beupatna",
+        "published_at": "2026-11-20",
+        "flaws": [
+            "Drawing/projection questions ko live solve karne ke bajay sirf oral list aur screenshot par chhod diya."
+        ],
+        "predicted_next": ["other 1st sem subjects VVI", "exam day tips"],
+        "beat_topic": "BEU 1st Sem EGD / High-Weightage Topics: Step-by-Step Clarity & Topper Sheet Tips | Focus 07",
+        "thumb_text": "EGD VVI + SHEET TRICK",
+        "beat_angle": "Sirf screenshot bolne ke bajay clean step-by-step approach aur exam-sheet mistakes se bachne ka shortcut do."
+    },
+]
+
+TOPIC_CUES = [
+    ("credit / subject priority", ["credit", "क्रेडिट", "किस सब्जेक्ट", "priority", "tough subject"]),
+    ("important / VVI / PYQ questions", ["important question", "vvi", "pyq", "previous year", "इंपॉर्टेंट क्वेश्चन"]),
+    ("viva / practical exam", ["viva", "वाइवा", "practical", "प्रैक्टिकल", "lab"]),
+    ("exam schedule / form / center", ["exam date", "schedule", "form", "center", "सेंटर", "शेड्यूल"]),
+    ("copy writing / MCQ / passing marks", ["copy", "mcq", "passing", "24", "marks", "सीजीपीए", "cgpa"]),
+    ("marathon / master class / revision", ["marathon", "मैराथन", "master class", "मास्टर क्लास", "last minute", "booster"]),
+]
 
 
-def get_channel_data():
-    if YT_CHANNEL_ID.startswith("@"):
-        ch_url = f"https://www.googleapis.com/youtube/v3/channels?part=snippet,statistics,contentDetails&forHandle={YT_CHANNEL_ID}&key={YT_API_KEY}"
-    else:
-        ch_url = f"https://www.googleapis.com/youtube/v3/channels?part=snippet,statistics,contentDetails&id={YT_CHANNEL_ID}&key={YT_API_KEY}"
-
-    ch_res = requests.get(ch_url, timeout=15).json()
-    if not ch_res.get("items"):
-        return None, []
-
-    channel_info = ch_res["items"][0]
-    uploads_playlist = channel_info["contentDetails"]["relatedPlaylists"]["uploads"]
-
-    pl_url = f"https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&playlistId={uploads_playlist}&maxResults=5&key={YT_API_KEY}"
-    pl_res = requests.get(pl_url, timeout=15).json()
-
-    video_ids = [item["snippet"]["resourceId"]["videoId"] for item in pl_res.get("items", [])]
-    if not video_ids:
-        return channel_info, []
-
-    vid_url = f"https://www.googleapis.com/youtube/v3/videos?part=snippet,statistics&id={','.join(video_ids)}&key={YT_API_KEY}"
-    vid_res = requests.get(vid_url, timeout=15).json()
-
-    return channel_info, vid_res.get("items", [])
-
-
-def get_video_transcript(video_id):
-    try:
-        ytt_api = YouTubeTranscriptApi()
-        transcript_list = ytt_api.fetch(video_id, languages=['hi', 'en', 'en-IN'])
-        full_text = " ".join([t.text for t in transcript_list])
-        return full_text[:3000]
-    except Exception:
+def load_mem():
+    if os.path.exists(MEM_FILE):
         try:
-            transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['hi', 'en', 'en-IN'])
-            full_text = " ".join([t['text'] for t in transcript_list])
-            return full_text[:3000]
+            with open(MEM_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict) and data.get("version") == 5:
+                    return data
         except Exception:
-            return "Transcript/Captions available nahi hain."
+            pass
+    return {"version": 5, "seen_ids": [], "last_sent_date": ""}
 
 
-def get_official_notices():
-    """Scrape latest headlines/notices from BEU, BCECEB, and SBTE official portals."""
-    portals = [
-        ("BEU Patna", "https://beu-bih.ac.in"),
-        ("BCECEB", "https://bceceboard.bihar.gov.in"),
-        ("SBTE Bihar", "https://sbte.bihar.gov.in")
-    ]
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    collected = []
+def save_mem(mem):
+    with open(MEM_FILE, "w", encoding="utf-8") as f:
+        json.dump(mem, f, ensure_ascii=False, indent=2)
 
-    for name, url in portals:
+
+def tg_send(text):
+    if not TG_TOKEN or not TG_CHAT:
+        print(text)
+        return False
+    for i in range(0, len(text), 3800):
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT, "text": text[i:i + 3800], "disable_web_page_preview": True},
+            timeout=25,
+        )
+        if not r.ok:
+            print("TG error:", r.status_code, r.text)
+            return False
+    return True
+
+
+def tg_send_photo(img_bytes, caption):
+    if not TG_TOKEN or not TG_CHAT:
+        print("Photo ready:", caption)
+        return False
+    r = requests.post(
+        f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
+        data={"chat_id": TG_CHAT, "caption": caption[:1000]},
+        files={"photo": ("focus07_thumbnail.png", io.BytesIO(img_bytes), "image/png")},
+        timeout=45,
+    )
+    if not r.ok:
+        print("TG photo error:", r.status_code, r.text)
+        return False
+    return True
+
+
+def fetch_html(url):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
+    }
+    r = requests.get(url, headers=headers, timeout=20)
+    r.raise_for_status()
+    return r.text
+
+
+def download_ref_thumbnail(vid):
+    for suffix in ["maxresdefault.jpg", "sddefault.jpg", "hqdefault.jpg"]:
         try:
-            res = requests.get(url, headers=headers, timeout=10, verify=False)
-            soup = BeautifulSoup(res.text, "html.parser")
-            links = []
-            for a in soup.find_all("a"):
-                txt = " ".join(a.get_text().split())
-                if len(txt) > 18 and any(k in txt.lower() for k in [
-                    "notice", "exam", "result", "admit", "form", "registration",
-                    "schedule", "counselling", "mop", "spot", "semester", "2026", "date"
-                ]):
-                    if txt not in links:
-                        links.append(txt[:110])
-                if len(links) >= 3:
-                    break
-            if links:
-                collected.append(f"[{name}]: " + " | ".join(links))
-            else:
-                collected.append(f"[{name}]: Portal reachable, no new keyword notice.")
+            r = requests.get(f"https://i.ytimg.com/vi/{vid}/{suffix}", timeout=15)
+            if r.ok and len(r.content) > 4000:
+                img = Image.open(io.BytesIO(r.content)).convert("RGB")
+                w, h = img.size
+                if h > 0 and abs((w / h) - (16 / 9)) > 0.15:
+                    target_h = int(w * 9 / 16)
+                    if target_h < h:
+                        top = (h - target_h) // 2
+                        img = img.crop((0, top, w, top + target_h))
+                return img
         except Exception:
-            collected.append(f"[{name}]: Server slow/down today.")
+            continue
+    return None
 
-    return "\n".join(collected)
+
+def generate_better_thumbnail(item, ref_img):
+    thumb_txt = item.get("thumb_text", "FOCUS 07 EXAM PLAN")
+    title = item.get("title", "")
+
+    if OPENAI_API_KEY:
+        prompt = (
+            f"Create a high-CTR 16:9 YouTube thumbnail for Bihar Engineering University (BEU) students "
+            f"on the 'Focus 07' channel. Improve upon competitor video '{title}' with a bold dark navy "
+            f"& electric blue background, glowing yellow and red highlight badges, clean exam checklist/scorecard "
+            f"graphics, and huge crisp mobile-readable text: '{thumb_txt}' and 'FOCUS 07'. "
+            f"No watermarks, no small clutter."
+        )
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+        for model_name, size_val in [("gpt-image-1", "1536x1024"), ("dall-e-3", "1792x1024")]:
+            try:
+                r = requests.post(
+                    "https://api.openai.com/v1/images/generations",
+                    headers=headers,
+                    json={"model": model_name, "prompt": prompt, "size": size_val, "n": 1},
+                    timeout=75,
+                )
+                if not r.ok:
+                    continue
+                data0 = (r.json().get("data") or [{}])[0]
+                if data0.get("b64_json"):
+                    return Image.open(io.BytesIO(base64.b64decode(data0["b64_json"]))).convert("RGB"), "OpenAI API"
+                if data0.get("url"):
+                    ir = requests.get(data0["url"], timeout=30)
+                    if ir.ok:
+                        return Image.open(io.BytesIO(ir.content)).convert("RGB"), "OpenAI API"
+            except Exception:
+                continue
+
+    W, H = 1280, 720
+    canvas = Image.new("RGB", (W, H), (10, 18, 42))
+    draw = ImageDraw.Draw(canvas)
+    draw.rectangle([0, 0, W, 18], fill=(255, 193, 7))
+    draw.rectangle([0, H - 18, W, H], fill=(239, 68, 68))
+
+    if ref_img is not None:
+        side = ref_img.resize((420, 236))
+        draw.rounded_rectangle([815, 195, 1245, 441], radius=16, fill=(25, 39, 82), outline=(255, 193, 7), width=3)
+        canvas.paste(side, (820, 200))
+        draw.text((825, 452), "COMPETITOR REF", fill=(255, 193, 7))
+
+    font = ImageFont.load_default()
+    draw.rounded_rectangle([55, 70, 310, 125], radius=10, fill=(239, 68, 68))
+    draw.text((75, 88), "🔥 FOCUS 07 UPGRADE", fill=(255, 255, 255), font=font)
+    draw.text((60, 190), thumb_txt, fill=(255, 214, 10), font=font)
+    draw.text((60, 265), f"BEAT: {item.get('channel', '')[:38]}", fill=(255, 255, 255), font=font)
+    draw.text((60, 335), f"IDEA: {item.get('beat_topic', '')[:58]}", fill=(147, 197, 253), font=font)
+    return canvas, "Local Fallback"
 
 
-def get_realtime_trends():
-    keywords = ["Bihar Engineering", "Bihar Polytechnic", "Bihar Paramedical", "BCECE", "JEE Mains"]
-    trends_summary = []
+def deep_analyze_fetched(vid, url, fallback_ch="Competitor"):
+    title = vid
+    channel = fallback_ch
+    pub = NOW_IST.strftime("%Y-%m-%d")
+    views = ""
+    desc = ""
+
     try:
-        pytrends = TrendReq(hl='en-IN', tz=330, timeout=(8, 15))
-        pytrends.build_payload(keywords, cat=0, timeframe='now 7-d', geo='IN')
-        related = pytrends.related_queries()
-        for kw in keywords:
-            if kw in related and related[kw]['rising'] is not None:
-                top_rising = related[kw]['rising']['query'].head(3).tolist()
-                trends_summary.append(f"{kw}: {', '.join(top_rising)}")
-    except Exception as e:
-        trends_summary.append(f"Trends fallback active ({str(e)[:40]})")
-
-    return "\n".join(trends_summary) if trends_summary else "Ongoing BEU/BCECE/DCECE exam & counselling cycle."
-
-
-def get_working_models(client):
-    """Discover active Gemini models including lite/pro fallbacks to beat 503 high-demand spikes."""
-    candidates = ["gemini-3.8-flash-lite", "gemini-3.8-flash", "gemini-3.8-pro"]
-    try:
-        for m in client.models.list():
-            name = getattr(m, "name", "").replace("models/", "")
-            methods = getattr(m, "supported_generation_methods", []) or []
-            if name and ("flash" in name or "pro" in name) and not any(old in name for old in ["1.0", "1.5", "2.0", "2.5", "image", "tts", "embedding"]):
-                if not methods or "generateContent" in methods:
-                    if name not in candidates:
-                        candidates.append(name)
+        html = fetch_html(url)
+        mt = re.search(r'"title":"([^"]+)"', html)
+        if mt:
+            title = json.loads(f'"{mt.group(1)}"')
+        mc = re.search(r'"ownerChannelName":"([^"]+)"', html)
+        if mc:
+            channel = json.loads(f'"{mc.group(1)}"')
+        mp = re.search(r'"publishDate":"([^"]+)"', html)
+        if mp:
+            pub = mp.group(1)[:10]
+        md = re.search(r'"shortDescription":"((?:\\.|[^"\\])*)"', html)
+        if md:
+            desc = json.loads(f'"{md.group(1)}"')
+        mv = re.search(r'"viewCount":"(\d+)"', html)
+        if mv:
+            views = f"{int(mv.group(1)):,}"
     except Exception:
         pass
-    return candidates[:6]
+
+    low = f"{title}\n{desc}".lower()
+    flaws = []
+    if len(desc) < 120:
+        flaws.append("Description kaafi short hai; SEO & direct resource links kamzor hain.")
+    if "app" in low or "batch" in low or "course" in low:
+        flaws.append("Paid app/batch ka pitch zyada hai; free actionable takeaways kam ho sakte hain.")
+    if "comment" in low and ("question" in low or "topic" in low):
+        flaws.append("Topic/PYQ deliver karne ke bajay pehle comments mangwaye ja rahe hain.")
+    if not flaws:
+        flaws.append("Lamba format/intro hone par retention gir sakta hai.")
+
+    predicted = []
+    for label, kws in TOPIC_CUES:
+        if any(k in low for k in kws):
+            predicted.append(label)
+    if not predicted:
+        predicted.append("semester exam / PYQ / update")
+
+    beat_topic = f"BEU Latest: {title[:55].strip()} | Fast Notes & Strategy | Focus 07"
+    thumb_text = "BEU FAST TRACK"
+    if "5th" in low or "syllabus" in low:
+        beat_topic = "BEU 5th Sem Short Timeline: Subject Priority & PYQ Strategy | Focus 07"
+        thumb_text = "5TH SEM FAST PLAN"
+    elif "1st" in low or "exam" in low or "egd" in low:
+        beat_topic = "BEU 1st Sem Exam & High-Weightage Topics: Crisp Score Plan | Focus 07"
+        thumb_text = "1ST SEM SCORE HACK"
+
+    return {
+        "channel": channel,
+        "video_id": vid,
+        "url": url,
+        "title": title,
+        "published_at": pub,
+        "views": views,
+        "flaws": flaws,
+        "predicted_next": predicted[:4],
+        "beat_topic": beat_topic,
+        "thumb_text": thumb_text,
+        "beat_angle": "Unse kam intro, zyada crisp step-by-step clarity, aur seedha Telegram/notes value do.",
+    }
 
 
-def generate_coach_report(client, channel_info, videos, transcript, trends_text, notices_text):
-    subs = channel_info["statistics"].get("subscriberCount", "Hidden")
-    total_views = channel_info["statistics"].get("viewCount", "0")
+def discover_live_videos(seen_ids):
+    known = {v["video_id"] for v in SEED_VIDEOS}
+    extra_urls = [u.strip() for u in os.getenv("COMPETITOR_URLS", "").split(",") if u.strip()]
+    targets = [c["url"] for c in CHANNELS] + extra_urls
 
-    video_lines = []
-    for i, v in enumerate(videos, 1):
-        title = v["snippet"]["title"]
-        views = v["statistics"].get("viewCount", "0")
-        likes = v["statistics"].get("likeCount", "0")
-        comments = v["statistics"].get("commentCount", "0")
-        pub = v["snippet"]["publishedAt"][:10]
-        video_lines.append(f"{i}. [{pub}] '{title}' -> {views} views, {likes} likes, {comments} comments")
-
-    thumb_image = None
-    try:
-        latest_vid = videos[0]
-        thumbs = latest_vid["snippet"]["thumbnails"]
-        thumb_url = thumbs.get("maxres", thumbs.get("high", thumbs.get("default")))["url"]
-        img_bytes = requests.get(thumb_url, timeout=15).content
-        thumb_image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    except Exception:
-        thumb_image = None
-
-    prompt = f"""
-Tum YouTube Growth Coach ho Shivam ke channel 'Focus 07' (Bihar Engineering University BEU, BCECE, DCECE, Polytechnic, Paramedical updates) ke liye.
-Aaj ki date hai: {TODAY_STR}.
-
-CHANNEL DATA:
-- Subscribers: {subs} | Total Views: {total_views}
-- Recent 5 Videos:
-{chr(10).join(video_lines)}
-
-LATEST VIDEO TRANSCRIPT:
-{transcript}
-
-OFFICIAL WEBSITE LIVE NOTICES (BEU / BCECEB / SBTE):
-{notices_text}
-
-GOOGLE REAL-TIME RISING TRENDS (India):
-{trends_text}
-
-TUMHARA KAAM (Hinglish mein, clean plain text with emojis aur bullet points — bilkul bhi HTML tags ya markdown ** # use mat karna):
-
-1. 🏛️ LIVE OFFICIAL NOTICE RADAR ({TODAY_STR}):
-BEU, BCECEB aur SBTE websites ke taaza notices ka short update aur kis par turant video banana chahiye.
-
-2. 📊 CHANNEL SNAPSHOT & THUMBNAIL AUDIT:
-Subscribers, views aur attached thumbnail/transcript mein kya sudhaar karein (2-3 crisp points).
-
-3. 🔥 AAJ KE 5 VIRAL VIDEO TOPICS ({TODAY_STR}):
-Har topic ke liye EXACT isi format mein likho:
-Topic 1: [Topic Name]
-Clickable Title: [High-CTR Hinglish Title]
-Thumbnail Text: [EXACT 3-4 CAPITAL ENGLISH/HINGLISH WORDS]
-Kyun chalega: [1 line reason]
-
-(Isi tarah Topic 2, Topic 3, Topic 4, Topic 5 likho)
-
-4. 🚀 READY-TO-PASTE SEO PACK (Topic 1 & Topic 2 ke liye):
-- Topic 1 Description (3-4 lines with hashtags #BEU #Focus07 #BiharEngineering)
-- Topic 1 Viral Tags (comma-separated 12 keywords)
-- Topic 1 Pinned Comment (Telegram & Study Notes portal call-to-action ke saath)
-- Topic 2 Description, Viral Tags & Pinned Comment
-"""
-
-    models_to_try = get_working_models(client)
-    # Try up to 2 rounds with a 15-second pause if Google servers return 503 high demand
-    for attempt in range(2):
-        for model_name in models_to_try:
-            try:
-                contents_payload = [thumb_image, prompt] if thumb_image is not None else [prompt]
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=contents_payload
-                )
-                if response and response.text:
-                    return response.text
-            except Exception as e:
-                err_str = str(e)
-                if "503" in err_str or "UNAVAILABLE" in err_str:
-                    time.sleep(8)
-                    continue
-                if thumb_image is not None:
-                    try:
-                        response = client.models.generate_content(
-                            model=model_name,
-                            contents=prompt
-                        )
-                        if response and response.text:
-                            return response.text
-                    except Exception:
-                        pass
-                continue
-        if attempt == 0:
-            time.sleep(15)
-
-    # Smart Fallback Report so bot NEVER crashes even during Google 503 server spikes
-    return f"""⚠️ Note: Gemini AI servers abhi heavy traffic (503) par hain, isliye live scraped data & ready thumbnails bheje ja rahe hain:
-
-1. 🏛️ LIVE OFFICIAL NOTICE RADAR ({TODAY_STR}):
-{notices_text}
-
-2. 📊 CHANNEL SNAPSHOT:
-- Subscribers: {subs} | Total Views: {total_views}
-- Recent Videos:
-{chr(10).join(video_lines[:3])}
-
-3. 🔥 AAJ KE TOP 3 EVERGREEN VIRAL TOPICS ({TODAY_STR}):
-Topic 1: BEU Semester Exam & Result Big Update 2026
-Clickable Title: BEU Patna Big Update 2026 🚨 Semester Exam & Result Notice जारी!
-Thumbnail Text: BEU BIG NOTICE 2026!
-Kyun chalega: Bihar Engineering students roz latest exam aur result status search karte hain.
-
-Topic 2: Bihar Polytechnic SBTE Odd/Even Sem Strategy
-Clickable Title: SBTE Bihar Polytechnic Exam 2026 🔥 Pass Hone Ka Master Plan!
-Thumbnail Text: SBTE EXAM ALERT!
-Kyun chalega: Polytechnic students ke beech exam tips aur important questions ki high demand rehti hai.
-
-Topic 3: BCECE & DCECE Spot Counselling / Admission Guide
-Clickable Title: BCECE & DCECE 2026 🚨 Bachi Hui Seats Par Admission Kaise Lein?
-Thumbnail Text: SPOT ROUND UPDATE!
-Kyun chalega: Counselling aur vacant seats par high CTR milta hai.
-"""
-
-
-def create_thumbnails_batch(client, report_text):
-    """Generate up to 3 1280x720 YouTube thumbnails with shivam.png cutout on the right."""
-    thumb_matches = re.findall(r"Thumbnail Text:\s*(.+)", report_text, re.IGNORECASE)
-    title_matches = re.findall(r"Clickable Title:\s*(.+)", report_text, re.IGNORECASE)
-
-    if not thumb_matches:
-        thumb_matches = ["BEU BIG UPDATE 2026!", "SBTE EXAM ALERT!", "BCECE SPOT ROUND!"]
-    if not title_matches:
-        title_matches = ["Bihar Engineering University Latest Update"]
-
-    cutout_img = None
-    if os.path.exists("shivam.png"):
+    new_items = []
+    for ch_url in targets:
         try:
-            raw_cutout = Image.open("shivam.png").convert("RGBA")
-            target_h = 640
-            aspect = raw_cutout.width / raw_cutout.height
-            target_w = min(520, int(target_h * aspect))
-            cutout_img = raw_cutout.resize((target_w, target_h), Image.LANCZOS)
+            html = fetch_html(ch_url)
+            vids = list(dict.fromkeys(re.findall(r'"videoId":"([A-Za-z0-9_-]{11})"', html)))
+            for vid in vids[:3]:
+                if vid in known or vid in seen_ids:
+                    continue
+                known.add(vid)
+                v_url = f"https://www.youtube.com/watch?v={vid}"
+                info = deep_analyze_fetched(vid, v_url)
+                new_items.append(info)
+                time.sleep(0.4)
         except Exception:
-            cutout_img = None
-
-    font_paths = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
-    ]
-    font_path = next((p for p in font_paths if os.path.exists(p)), None)
-    badge_font = ImageFont.truetype(font_path, 36) if font_path else ImageFont.load_default()
-    main_font = ImageFont.truetype(font_path, 76 if cutout_img else 86) if font_path else ImageFont.load_default()
-    sub_font = ImageFont.truetype(font_path, 34) if font_path else ImageFont.load_default()
-
-    themes = [
-        ((14, 22, 48), (225, 25, 25), (255, 220, 0)),
-        ((32, 12, 42), (255, 95, 0), (0, 245, 212)),
-        ((15, 34, 26), (220, 38, 38), (255, 230, 50))
-    ]
-
-    generated_thumbs = []
-    for idx in range(min(3, len(thumb_matches))):
-        banner_text = re.sub(r'[^\w\s!?&/-]', '', thumb_matches[idx]).upper()[:36]
-        topic_context = title_matches[idx] if idx < len(title_matches) else "BEU Bihar Update"
-        base_rgb, badge_rgb, highlight_rgb = themes[idx % len(themes)]
-
-        bg_img = None
-        if idx == 0:
-            try:
-                img_prompt = (
-                    f"Dramatic YouTube thumbnail background for Indian engineering college news: {topic_context}. "
-                    "Dark moody studio lighting, glowing red and blue rim light, university campus silhouette, "
-                    "no text, no words, no letters, 16:9 widescreen."
-                )
-                res = client.models.generate_images(
-                    model="imagen-3.0-generate-002",
-                    prompt=img_prompt,
-                    config=types.GenerateImagesConfig(number_of_images=1, aspect_ratio="16:9")
-                )
-                if res.generated_images:
-                    raw_bytes = res.generated_images[0].image.image_bytes
-                    bg_img = Image.open(io.BytesIO(raw_bytes)).convert("RGBA").resize((1280, 720))
-            except Exception:
-                bg_img = None
-
-        if bg_img is None:
-            bg_img = Image.new("RGBA", (1280, 720), (*base_rgb, 255))
-            draw_bg = ImageDraw.Draw(bg_img)
-            for y in range(720):
-                factor = y / 720
-                r = min(255, int(base_rgb[0] + factor * 40))
-                g = min(255, int(base_rgb[1] + factor * 25))
-                b = min(255, int(base_rgb[2] + factor * 55))
-                draw_bg.line([(0, y), (1280, y)], fill=(r, g, b, 255))
-            draw_bg.rectangle([0, 0, 1280, 18], fill=(*badge_rgb, 255))
-            draw_bg.rectangle([0, 702, 1280, 720], fill=(*highlight_rgb, 255))
-
-        overlay = Image.new("RGBA", (1280, 720), (0, 0, 0, 105))
-        canvas = Image.alpha_composite(bg_img, overlay)
-
-        if cutout_img is not None:
-            x_pos = 1280 - cutout_img.width - 20
-            y_pos = 720 - cutout_img.height
-            canvas.alpha_composite(cutout_img, (x_pos, y_pos))
-
-        draw = ImageDraw.Draw(canvas)
-
-        draw.rounded_rectangle([55, 50, 510, 118], radius=12, fill=(*badge_rgb, 255))
-        draw.text((78, 65), f"FOCUS 07 • TOPIC #{idx + 1}", font=badge_font, fill=(255, 255, 255, 255))
-
-        wrap_width = 14 if cutout_img else 19
-        lines = textwrap.wrap(banner_text, width=wrap_width)[:3]
-        y_cursor = 175
-        for l_idx, line in enumerate(lines):
-            t_color = (*highlight_rgb, 255) if l_idx % 2 == 0 else (255, 255, 255, 255)
-            draw.text((61, y_cursor + 5), line, font=main_font, fill=(0, 0, 0, 240))
-            draw.text((55, y_cursor), line, font=main_font, fill=t_color)
-            y_cursor += 105
-
-        strip_right = 740 if cutout_img else 1220
-        draw.rounded_rectangle([55, 585, strip_right, 655], radius=12, fill=(*highlight_rgb, 255))
-        strip_label = "BEU • BCECE • SBTE UPDATE" if cutout_img else "BEU • BCECE • POLYTECHNIC OFFICIAL UPDATE"
-        draw.text((75, 603), strip_label, font=sub_font, fill=(15, 15, 15, 255))
-
-        buf = io.BytesIO()
-        canvas.convert("RGB").save(buf, format="JPEG", quality=92)
-        buf.seek(0)
-        generated_thumbs.append((buf, banner_text, idx + 1))
-
-    return generated_thumbs
+            continue
+    return new_items
 
 
-def send_telegram_message(text):
-    clean_text = re.sub(r'<[^>]+>', '', text).replace('**', '').replace('##', '')
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    paragraphs = clean_text.split('\n\n')
-    current_chunk = ""
-    for p in paragraphs:
-        if len(current_chunk) + len(p) + 2 < 3800:
-            current_chunk += p + "\n\n"
-        else:
-            if current_chunk.strip():
-                requests.post(url, json={"chat_id": CHAT_ID, "text": current_chunk.strip(), "disable_web_page_preview": True}, timeout=15)
-            current_chunk = p + "\n\n"
-    if current_chunk.strip():
-        requests.post(url, json={"chat_id": CHAT_ID, "text": current_chunk.strip(), "disable_web_page_preview": True}, timeout=15)
+def run():
+    mem = load_mem()
+    seen = set(mem.get("seen_ids", []))
+    os.makedirs(OUT_DIR, exist_ok=True)
 
+    new_items = discover_live_videos(seen)
+    report_items = new_items + SEED_VIDEOS
 
-def send_telegram_photo(image_buf, caption):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    files = {"photo": ("focus07_thumb.jpg", image_buf, "image/jpeg")}
-    data = {"chat_id": CHAT_ID, "caption": caption}
-    requests.post(url, data=data, files=files, timeout=25)
+    lines = [f"🚨 FOCUS 07 DEEP COMPETITOR & GADBAD REPORT ({NOW_IST.strftime('%d %b %Y, %I:%M %p IST')})"]
+
+    if new_items:
+        lines.append("\n🆕 NAYA VIDEO PACKDA GAYA:")
+        for ni in new_items:
+            lines.append(f"• [{ni['channel']}] {ni['title']} ({ni['published_at']})")
+            seen.add(ni["video_id"])
+
+    for item in report_items[:4]:
+        v_str = f" | Views: {item['views']}" if item.get("views") else ""
+        flaw_block = "\n     ❌ " + "\n     ❌ ".join(item["flaws"])
+        lines.append(
+            f"\n━━━━━━━━━━━━━━━━━━━━\n"
+            f"▶️ {item['channel']} ({item['published_at']}{v_str})\n"
+            f"📌 Video: {item['title']}\n"
+            f"⚠️ GADBAD REPORT:{flaw_block}\n"
+            f"🔮 Agla Kya La Sakte Hain: {', '.join(item['predicted_next'])}\n"
+            f"🏆 Beat Topic: {item['beat_topic']}\n"
+            f"🎯 Beat Angle: {item['beat_angle']}\n"
+            f"🖼️ Thumb Text: {item['thumb_text']}"
+        )
+
+    today_str = NOW_IST.strftime("%Y-%m-%d")
+    if new_items or FORCE or mem.get("last_sent_date") != today_str:
+        if tg_send("\n".join(lines)):
+            mem["last_sent_date"] = today_str
+
+        thumb_targets = new_items if new_items else SEED_VIDEOS[:2]
+        for item in thumb_targets:
+            ref_img = download_ref_thumbnail(item["video_id"])
+            gen_img, engine = generate_better_thumbnail(item, ref_img)
+            save_path = os.path.join(OUT_DIR, f"{item['video_id']}_focus07.png")
+            gen_img.save(save_path, format="PNG")
+            buf = io.BytesIO()
+            gen_img.save(buf, format="PNG")
+            tg_send_photo(
+                buf.getvalue(),
+                f"🖼️ Focus 07 Thumbnail ({engine})\nRef: {item['channel']} — {item['thumb_text']}",
+            )
+            time.sleep(1)
+
+    mem["seen_ids"] = list(seen)[-100:]
+    save_mem(mem)
 
 
 if __name__ == "__main__":
-    channel_info, videos = get_channel_data()
-    if not channel_info or not videos:
-        send_telegram_message("⚠️ Focus 07 Bot Alert: YouTube channel data fetch nahi ho paya.")
-    else:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        transcript = get_video_transcript(videos[0]["id"])
-        trends_text = get_realtime_trends()
-        notices_text = get_official_notices()
-
-        report = generate_coach_report(client, channel_info, videos, transcript, trends_text, notices_text)
-        send_telegram_message(report)
-
-        thumbs = create_thumbnails_batch(client, report)
-        for buf, b_text, num in thumbs:
-            send_telegram_photo(buf, f"🖼️ Topic #{num} Thumbnail (1280x720)\n📌 {b_text}")
-
+    run()
